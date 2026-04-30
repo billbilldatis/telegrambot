@@ -16,8 +16,8 @@ CHAT_ID = os.environ["CHAT_ID"]
 SEEN_FILE = "seen.json"
 STATS_FILE = "stats.json"
 TTL_SECONDS = 86400        # 24 hours
-TRAFFIC_HIGH = 100_000
-TRAFFIC_MID = 20_000
+TRAFFIC_HIGH = 20_00
+TRAFFIC_MID = 5_00
 MIN_TRAFFIC = 0            # Set > 0 to filter low-traffic topics
 SEND_DELAY = 1.5           # Seconds between Telegram messages (avoid flood limits)
 DIGEST_HOUR = 9            # Hour (UTC) to send daily digest (if run at this hour)
@@ -134,7 +134,8 @@ def parse_traffic(raw: str) -> int:
 # -----------------------
 def analyze(traffic: int, news_items: list) -> tuple[list, list]:
     sources = list({n["source"] for n in news_items if n["source"]})
- 
+
+
     if traffic >= TRAFFIC_HIGH:
         volume_label = "🔥 HIGH PUBLIC INTEREST"
     elif traffic >= TRAFFIC_MID:
@@ -298,7 +299,6 @@ def run() -> None:
     if not feed.entries:
         log.info("No entries in feed.")
         return
- 
     seen = clean_seen(load_json(SEEN_FILE))
     stats = load_json(STATS_FILE)
  

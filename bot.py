@@ -1,26 +1,80 @@
 import feedparser
 import json
+import re
+import sys
 import time
 import requests
 import os
 import logging
 from datetime import datetime, timezone
 from collections import Counter
- 
+
+__version__ = "1.1.0"
+
 # -----------------------
 # CONFIG
 # -----------------------
-URL = "https://trends.google.com/trending/rss?geo=GR"
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-SEEN_FILE = "seen.json"
-STATS_FILE = "stats.json"
-TTL_SECONDS = 86400        # 24 hours
-TRAFFIC_HIGH = 50_00
-TRAFFIC_MID = 1_00
-MIN_TRAFFIC = 0            # Set > 0 to filter low-traffic topics
-SEND_DELAY = 1.5           # Seconds between Telegram messages (avoid flood limits)
-DIGEST_HOUR = 9            # Hour (UTC) to send daily digest (if run at this hour)
+# Everything except the two required secrets has a sane default and can be
+# overridden through environment variables — no source edits needed.
+URL = os.environ.get("TRENDS_URL", "https://trends.google.com/trending/rss?geo=GR")
+# Required secrets — validated in run() so ``--stats`` works without them.
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+SEEN_FILE = os.environ.get("SEEN_FILE", "seen.json")
+STATS_FILE = os.environ.get("STATS_FILE", "stats.json")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(f"Invalid integer in env var {name}={raw!r}; using default {default}.")
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning(f"Invalid number in env var {name}={raw!r}; using default {default}.")
+        return default
+
+
+TTL_SECONDS = _env_int("TTL_SECONDS", 86400)        # 24 hours
+TRAFFIC_HIGH = _env_int("TRAFFIC_HIGH", 5_000)      # >= this = "HIGH PUBLIC INTEREST"
+TRAFFIC_MID = _env_int("TRAFFIC_MID", 100)          # >= this = "MODERATE TREND"
+MIN_TRAFFIC = _env_int("MIN_TRAFFIC", 0)            # Set > 0 to filter low-traffic topics
+SEND_DELAY = _env_float("SEND_DELAY", 1.5)          # Seconds between Telegram messages (avoid flood limits)
+DIGEST_HOUR = _env_int("DIGEST_HOUR", 9)            # Hour (UTC) to send daily digest (if run at this hour)
+FETCH_TIMEOUT = _env_int("FETCH_TIMEOUT", 30)       # Seconds to wait for the Trends feed
+USER_AGENT = f"greek-trends-telegram-bot/{__version__}"
+
+_MD_SPECIALS = re.compile(r"([_*\[\]`\\])")
+
+
+def escape_md(text: str) -> str:
+    """Escape Telegram legacy-Markdown special characters in plain text.
+
+    Topic titles and news headlines come straight from the feed and routinely
+    contain ``*``, ``_``, ``[`` or backticks. Interpolated raw, a single stray
+    ``*`` produces malformed markup and Telegram rejects the whole message with
+    HTTP 400 — the entry is then never marked as seen and is retried on every
+    run forever. Escaping turns those characters into inert text.
+    """
+    if not text:
+        return ""
+    return _MD_SPECIALS.sub(r"\\\1", text)
+
+
+def escape_md_url(url: str) -> str:
+    """Make a URL safe to embed in a Markdown link target."""
+    return url.replace(")", "%29").replace("\\", "%5C")
  
 logging.basicConfig(
     level=logging.INFO,
@@ -226,8 +280,13 @@ def load_json(path: str) -> dict:
         return {}
  
 def save_json(path: str, data: dict) -> None:
-    with open(path, "w") as f:
+    """Atomically write JSON: temp file + os.replace, so a crash mid-write
+    can never corrupt the on-disk state (a corrupt ``seen.json`` would reset
+    the dedup cache and re-send every topic)."""
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
  
 def clean_seen(seen: dict) -> dict:
     now = time.time()
@@ -236,11 +295,19 @@ def clean_seen(seen: dict) -> dict:
     if removed:
         log.info(f"Cleaned {removed} expired entries from seen cache.")
     return cleaned
+
+
+def _now_utc() -> datetime:
+    """Current UTC time — module-level so tests can pin it."""
+    return datetime.now(timezone.utc)
  
 # -----------------------
 # PARSE TRAFFIC
 # -----------------------
 def parse_traffic(raw: str) -> int:
+    # Numeric values (e.g. from tests or a re-serialized feed) pass through.
+    if isinstance(raw, (int, float)):
+        return int(raw)
     try:
         raw = raw.strip().upper().replace(",", "")
         if "M" in raw:
@@ -277,10 +344,29 @@ def analyze(traffic: int, news_items: list) -> tuple[list, list]:
 # -----------------------
 # FORMAT MAIN MESSAGE
 # -----------------------
+def format_published(published_raw: str, published_parsed) -> str:
+    """Pretty-print the feed timestamp as UTC.
+
+    feedparser exposes ``published_parsed`` (a UTC struct_time) — the reliable
+    path. The raw RFC-822 string (e.g. ``...GMT``) is not directly parseable
+    by :func:`datetime.strptime` with ``%z`` (which expects a numeric offset),
+    so we only fall back to it verbatim.
+    """
+    if published_parsed:
+        try:
+            return datetime(*published_parsed[:6], tzinfo=timezone.utc).strftime(
+                "%d %b %Y, %H:%M UTC"
+            )
+        except (TypeError, ValueError):
+            pass
+    return published_raw or "Unknown"
+
+
 def format_message(
     topic: str,
     traffic: int,
-    published: str,
+    published_raw: str,
+    published_parsed,
     analysis: list,
     sources: list,
     news_items: list,
@@ -290,24 +376,22 @@ def format_message(
     rank: int,
     total: int,
 ) -> str:
-    try:
-        dt = datetime.strptime(published, "%a, %d %b %Y %H:%M:%S %z")
-        published_fmt = dt.strftime("%d %b %Y, %H:%M UTC")
-    except (ValueError, TypeError):
-        published_fmt = published or "Unknown"
- 
+    published_fmt = format_published(published_raw, published_parsed)
+
     traffic_fmt = f"{traffic:,}" if traffic else "N/A"
-    sources_text = ", ".join(sources) if sources else "N/A"
+    sources_text = ", ".join(escape_md(s) for s in sources) if sources else "N/A"
     news_lines = "\n".join(
-        f"  • [{n['title']}]({n['url']})" if n.get("url") else f"  • {n['title']} ({n['source']})"
+        f"  • [{escape_md(n['title'])}]({escape_md_url(n['url'])})"
+        if n.get("url")
+        else f"  • {escape_md(n['title'])} ({escape_md(n['source'])})"
         for n in news_items[:5]
     ) or "  No related news."
- 
+
     return (
-        f"{category} | #{rank} of {total}\n"
+        f"{escape_md(category)} | #{rank} of {total}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 *TREND REPORT*\n"
-        f"🔎 *Topic:* {topic}\n"
+        f"🔎 *Topic:* {escape_md(topic)}\n"
         f"👥 *Traffic:* {traffic_fmt}\n"
         f"🕐 *Published:* {published_fmt}\n\n"
         f"*Trend Score:* `{score_bar(score)}`\n\n"
@@ -317,7 +401,7 @@ def format_message(
         f"{sources_text}\n\n"
         f"*Related News*\n"
         f"{news_lines}\n\n"
-        f"🔗 [View on Google Trends]({link})"
+        f"🔗 [View on Google Trends]({escape_md_url(link)})"
     )
  
 # -----------------------
@@ -333,13 +417,15 @@ def format_digest(entries_data: list) -> str:
  
     lines = ["📋 *DAILY DIGEST — Greece Trends*\n━━━━━━━━━━━━━━━━━━"]
     for i, e in enumerate(top, 1):
-        lines.append(f"{i}. *{e['topic']}* — {e['traffic']:,} searches ({e['category']})")
- 
+        lines.append(
+            f"{i}. *{escape_md(e['topic'])}* — {e['traffic']:,} searches ({escape_md(e['category'])})"
+        )
+
     lines.append(f"\n📦 *Total topics sent:* {len(entries_data)}")
     lines.append(f"📊 *Total searches:* {total_traffic:,}")
     lines.append("\n*Categories breakdown:*")
     for cat, count in category_counts.most_common():
-        lines.append(f"  {cat}: {count}")
+        lines.append(f"  {escape_md(cat)}: {count}")
  
     return "\n".join(lines)
  
@@ -394,7 +480,7 @@ def send_entry(message: str, image_url: str | None) -> bool:
 # STATS TRACKING
 # -----------------------
 def update_stats(stats: dict, entry_data: dict) -> dict:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = _now_utc().strftime("%Y-%m-%d")
     if today not in stats:
         stats[today] = {"topics": 0, "total_traffic": 0, "categories": {}}
  
@@ -409,11 +495,70 @@ def update_stats(stats: dict, entry_data: dict) -> dict:
     return {k: stats[k] for k in all_days[-30:]}
  
 # -----------------------
+# FEED FETCH
+# -----------------------
+def fetch_feed() -> bytes:
+    """Download the Trends RSS feed with a hard timeout.
+
+    ``feedparser.parse(url)`` performs an unbounded network read underneath —
+    against a stalled connection the cron job would hang past its next
+    scheduled run. Fetching first with :func:`requests.get` keeps the whole
+    run bounded by ``FETCH_TIMEOUT`` seconds.
+    """
+    resp = requests.get(
+        URL, timeout=FETCH_TIMEOUT, headers={"User-Agent": USER_AGENT}
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+# -----------------------
+# STATS REPORT
+# -----------------------
+def print_stats(stats: dict) -> None:
+    """Human-readable summary of persisted stats (``python bot.py --stats``)."""
+    if not stats:
+        print("No stats recorded yet — run the bot once, then stats.json is persisted.")
+        return
+    print(f"{'Date':<12}{'Topics':>8}{'Searches':>14}  Top category")
+    print("-" * 50)
+    for day, data in sorted(stats.items())[-7:]:
+        cats = data.get("categories", {})
+        top_cat = max(cats, key=cats.get) if cats else "—"
+        print(f"{day:<12}{data.get('topics', 0):>8}{data.get('total_traffic', 0):>14,}  {top_cat}")
+
+
+# -----------------------
 # MAIN
 # -----------------------
+def _require_secrets() -> bool:
+    missing = [
+        name
+        for name, value in (("TELEGRAM_BOT_TOKEN", BOT_TOKEN), ("CHAT_ID", CHAT_ID))
+        if not value
+    ]
+    if missing:
+        log.error(f"Missing required environment variable(s): {', '.join(missing)}")
+        return False
+    return True
+
+
 def run() -> None:
+    if "--stats" in sys.argv:
+        print_stats(load_json(STATS_FILE))
+        return
+
+    if not _require_secrets():
+        return
+
     log.info("Fetching Google Trends feed...")
-    feed = feedparser.parse(URL)
+    try:
+        content = fetch_feed()
+    except requests.RequestException as e:
+        log.error(f"Feed fetch failed: {e}")
+        return
+
+    feed = feedparser.parse(content)
  
     if feed.bozo:
         log.warning(f"Feed parse warning: {feed.bozo_exception}")
@@ -463,7 +608,8 @@ def run() -> None:
         message = format_message(
             topic=topic,
             traffic=traffic,
-            published=entry.get("published", ""),
+            published_raw=entry.get("published", ""),
+            published_parsed=entry.get("published_parsed"),
             analysis=analysis,
             sources=sources,
             news_items=news_items,

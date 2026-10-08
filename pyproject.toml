@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "greek-trends-telegram-bot"
+description = "Telegram bot that monitors Greek Google Trends and posts categorized trend reports"
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+license = { text = "MIT" }
+authors = [{ name = "billbilldatis" }]
+keywords = ["telegram", "bot", "trends", "google-trends", "greece", "rss"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content :: News/Diary",
+]
+dependencies = [
+    "feedparser>=6.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+trends-bot = "bot:run"
+
+[project.urls]
+Homepage = "https://github.com/billbilldatis/telegrambot"
+
+[tool.setuptools]
+py-modules = ["bot"]
+
+[tool.setuptools.dynamic]
+version = { attr = "bot.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
